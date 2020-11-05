@@ -158,3 +158,123 @@ class GGXRenderer:
         
         return [result]#, D_rendered, G_rendered, F_rendered, diffuse_rendered, diffuse]
     
+
+class Loss:
+    batchSize = 8
+    lossValue = 0
+    crop_size = 256
+    beta1Adam = 0.5
+    
+    
+    #This defines the number of renderings for the rendering loss at each step.
+    nbDiffuseRendering = 3
+    nbSpecularRendering = 6
+
+    outputs = None
+    targets = None
+    surfaceArray = None
+    outputsRenderings = None
+    targetsRenderings = None
+    
+    L1 = torch.nn.L1Loss()
+    epsilonL1 = 0.01
+    epsilonRender = 0.1
+    
+
+    def __init__(self, crop_size, disentangled):
+        self.crop_size = crop_size
+        self.disentangled = disentangled
+        
+    
+     #Compute the loss using the L1 on the parameters.
+    def __l1Loss(self):
+        #outputs have shape [?, height, width, 12]
+        #targets have shape [?, height, width, 12]
+        outputsNormal = self.outputs[:,:,:,0:3]
+        outputsDiffuse = torch.log(self.epsilonL1 + helpers.deprocess(self.outputs[:,:,:,3:6]))
+        outputsRoughness = self.outputs[:,:,:,6:9]
+        outputsSpecular = torch.log(self.epsilonL1 + helpers.deprocess(self.outputs[:,:,:,9:12]))
+
+        targetsNormal = self.targets[:,:,:,0:3]
+        targetsDiffuse = torch.log(self.epsilonL1 + helpers.deprocess(self.targets[:,:,:,3:6]))
+        targetsRoughness = self.targets[:,:,:,6:9]
+        targetsSpecular = torch.log(self.epsilonL1 + helpers.deprocess(self.targets[:,:,:,9:12]))
+
+        return self.L1(outputsNormal, targetsNormal) + self.L1(outputsDiffuse, targetsDiffuse) + self.L1(outputsRoughness, targetsRoughness) + self.L1(outputsSpecular, targetsSpecular)
+        
+    #Generate the different renderings and concatenate the diffuse an specular renderings.
+    def __generateRenderings(self, renderer):
+        if self.disentangled:
+            #Not doing normals because our method doesnt need to predict them
+            '''
+            normals_outputs = self.outputs.clone()
+            normals_outputs[:,:,:,3:12] = self.targets
+            diffuses0 = helpers.generateDiffuseRendering(2, self.nbDiffuseRendering, self.targets, normals_outputs, renderer)
+            speculars0 = helpers.generateSpecularRendering(1, self.nbSpecularRendering, self.surfaceArray, self.targets, normals_outputs, renderer)
+            '''
+            
+            #do output diffuse alone
+            diffuse_outputs = self.outputs.clone()
+            #diffuse_outputs[:,:,:,:3] = self.targets
+            diffuse_outputs[:,:,:,6:12] = self.targets
+            diffuses1 = helpers.generateDiffuseRendering(2, self.nbDiffuseRendering, self.targets, diffuse_outputs, renderer)
+            speculars1 = helpers.generateSpecularRendering(1, self.nbSpecularRendering, self.surfaceArray, self.targets, diffuse_outputs, renderer)
+            
+            #do output roughness alone
+            roughness_outputs = self.outputs.clone()
+            roughness_outputs[:,:,:,3:6] = self.targets
+            roughness_outputs[:,:,:,9:12] = self.targets
+            diffuses2 = helpers.generateDiffuseRendering(1, self.nbDiffuseRendering, self.targets, roughness_outputs, renderer)
+            speculars2 = helpers.generateSpecularRendering(2, self.nbSpecularRendering, self.surfaceArray, self.targets, roughness_outputs, renderer)
+            
+            #do output specular alone
+            specular_outputs = self.outputs.clone()
+            specular_outputs[:,:,:,3:9] = self.targets
+            diffuses3 = helpers.generateDiffuseRendering(1, self.nbDiffuseRendering, self.targets, specular_outputs, renderer)
+            speculars3 = helpers.generateSpecularRendering(2, self.nbSpecularRendering, self.surfaceArray, self.targets, specular_outputs, renderer)
+            
+            targetsRendered = torch.cat([diffuses1[0],speculars1[0],diffuses2[0],speculars2[0],diffuses3[0],speculars3[0]], axis = 1)
+            outputsRendered = torch.cat([diffuses1[1],speculars1[1],diffuses2[1],speculars2[1],diffuses3[1],speculars3[1]], axis = 1)
+            return targetsRendered, outputsRendered
+            
+        else:
+            diffuses = helpers.generateDiffuseRendering(self.batchSize, self.nbDiffuseRendering, self.targets, self.outputs, renderer)
+            speculars = helpers.generateSpecularRendering(self.batchSize, self.nbSpecularRendering, self.surfaceArray, self.targets, self.outputs, renderer)
+            targetsRendered = torch.cat([diffuses[0],speculars[0]], axis = 1)
+            outputsRendered = torch.cat([diffuses[1],speculars[1]], axis = 1)
+        return targetsRendered, outputsRendered
+    
+    #Compute the rendering loss
+    def __renderLoss(self):
+        #Generate the grid of position between -1,1 used for rendering
+        self.surfaceArray = helpers.generateSurfaceArray(self.crop_size)
+        
+        #Initialize the renderer
+        rendererImpl = GGXRenderer()
+        self.targetsRenderings, self.outputsRenderings = self.__generateRenderings(rendererImpl)
+        
+        #Compute the L1 loss between the renderings, epsilon are here to avoid log(0)        
+        targetsLogged = torch.log(self.targetsRenderings + self.epsilonRender) # Bias could be improved to 0.1 if the network gets upset.
+        outputsLogged = torch.log(self.outputsRenderings + self.epsilonRender)
+        lossTotal = self.L1(targetsLogged, outputsLogged)
+       
+        #Return the loss
+        return lossTotal
+    
+        #Compute both the rendering loss and the L1 loss on parameters and return this value.
+    def __mixedLoss(self, lossL1Factor = 0.1):
+        return self.__renderLoss() + lossL1Factor * self.__l1Loss()
+    
+    def compute_loss(self, loss_type, outputs, targets):
+        self.outputs = outputs
+        self.targets = targets
+        self.batchSize = self.outputs.shape[0]
+        
+        if loss_type == "L1":
+            self.lossValue = self.__l1Loss()
+        elif loss_type == "render":
+            self.lossValue = self.__renderLoss()
+        elif loss_type == "mixed":
+            self.lossValue = self.__mixedLoss()
+            
+        return self.lossValue
