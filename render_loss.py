@@ -92,12 +92,6 @@ class GGXRenderer:
         resultShape = result.shape
         lampIntensity = 1.5
         
-        #midway = result[0][0]
-        #io.imsave("midway.jpg",midway)
-        
-        result = torch.from_numpy(np.load("result.npy"))
-        NdotL =  torch.from_numpy(np.load("NdotL.npy")) #np.save("NdotL.npy",NdotL.numpy())
-        
         #Add lighting effects
         if not currentConeTargetPos is None:
             #If we want a cone light (to have a flash fall off effect)
